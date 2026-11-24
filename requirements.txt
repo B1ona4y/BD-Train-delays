@@ -1,0 +1,31 @@
+# Python 3.10+ (Spark containers use 3.10, local dev can use 3.12)
+
+# --- Big Data core ---
+pyspark==4.0.1              # must match the Spark version in docker-compose.yml
+pyarrow>=17.0               # Parquet + fast Spark <-> pandas conversion
+numpy>=1.26                 # required by Spark MLlib
+pandas>=2.2
+
+# --- Kafka ---
+aiokafka>=0.11              # async consumer for FastAPI
+kafka-python>=2.0.2         # simple producer (replaying archive -> train-updates)
+
+# --- Data source (GTFS-Realtime) ---
+gtfs-realtime-bindings>=1.0.0
+requests>=2.32
+
+# --- EDA ---
+jupyterlab>=4.2
+ipykernel>=6.29
+matplotlib>=3.9
+seaborn>=0.13
+plotly>=5.24
+
+# --- Web app ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+streamlit>=1.38
+python-dotenv>=1.0
+
+# --- Dev ---
+ruff>=0.6
