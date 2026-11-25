@@ -1,8 +1,10 @@
 """Outputs (all within data/clean/):
   clean_stops.parquet/           Unique, validated stop records (all statuses)
+  model_stops.parquet/           Stops eligible for ML feature engineering
   review_duplicates.parquet/     Conflicting versions of the same stop
   invalid_keys.parquet/         Rows lacking a usable stop identifier
   quality_report.json           Reproducible row counts and quality statistics
+  model_filter_report.json      Counts of excluded rows and flagged outliers
 
 Run from the repository root:
   docker compose exec jupyter /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/project/src/clean_data.py
@@ -50,7 +52,13 @@ def main():
     parser.add_argument("--input", default="/opt/project/data/dirty")
     parser.add_argument("--output", default="/opt/project/data/clean")
     parser.add_argument("--master", default=os.environ.get("SPARK_MASTER", "local[*]"))
+    parser.add_argument("--outlier-threshold", type=float, default=60.0,
+                        help="Flag absolute delays above this number of minutes (do not remove)")
+    parser.add_argument("--include-propagated", action="store_true",
+                        help="Keep propagated delay records in model_stops.parquet (excluded by default)")
     args = parser.parse_args()
+    if args.outlier_threshold <= 0:
+        parser.error("--outlier-threshold must be greater than zero")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     spark = (SparkSession.builder.appName("RailPredict-Clean-Stops")
@@ -91,10 +99,10 @@ def main():
         df = df.drop(*removed_empty_columns)
 
         invalid_key = (
-            F.col("service_date").isNull() |
-            F.col("trip_id").isNull() |
-            F.col("stop_sequence").isNull() |
-            (F.col("stop_sequence") < 0)
+                F.col("service_date").isNull() |
+                F.col("trip_id").isNull() |
+                F.col("stop_sequence").isNull() |
+                (F.col("stop_sequence") < 0)
         )
         invalid = df.filter(invalid_key)
         with_keys = df.filter(~invalid_key)
@@ -119,16 +127,49 @@ def main():
             "Row accounting mismatch: check ETL transformations"
         )
 
-        # Analyze the cleaned dataset but keep missing labels and special train
-        # statuses here. Selecting ML-eligible records belongs to feature building.
         stats = aggregate_counts(clean)
         null_counts = clean.agg(*[
             F.sum(F.col(c).isNull().cast("long")).alias(c)
             for c in clean.columns
         ]).first().asDict()
 
+        scheduled = clean.filter(F.col("trip_status") == "scheduled")
+        excluded_trip_status = clean_rows - scheduled.count()
+
+        non_skipped = scheduled.filter(
+            F.col("stop_status").isNull() | (F.col("stop_status") != "skipped")
+        )
+        excluded_skipped = scheduled.count() - non_skipped.count()
+
+        if args.include_propagated:
+            model_base = non_skipped
+            excluded_delay_source = 0
+        else:
+            model_base = non_skipped.filter(F.col("delay_source") == "feed")
+            excluded_delay_source = non_skipped.count() - model_base.count()
+
+        threshold = args.outlier_threshold
+        model_stops = (model_base
+                       .withColumn("arrival_delay_outlier",
+                                   F.coalesce(F.abs(F.col("arrival_delay_min")) > F.lit(threshold), F.lit(False)))
+                       .withColumn("departure_delay_outlier",
+                                   F.coalesce(F.abs(F.col("departure_delay_min")) > F.lit(threshold), F.lit(False))))
+
+        model_stats = model_stops.agg(
+            F.count("*").alias("rows"),
+            F.sum(F.col("arrival_delay_outlier").cast("long")).alias("arrival_outlier_rows"),
+            F.sum(F.col("departure_delay_outlier").cast("long")).alias("departure_outlier_rows"),
+            F.sum(F.col("arrival_delay_min").isNull().cast("long")).alias("missing_arrival_delay"),
+            F.sum(F.col("departure_delay_min").isNull().cast("long")).alias("missing_departure_delay"),
+        ).first().asDict()
+        model_rows = model_stats["rows"]
+        assert clean_rows == (excluded_trip_status + excluded_skipped + excluded_delay_source + model_rows), (
+            "Model filter row accounting mismatch"
+        )
+
         output = args.output.rstrip("/")
         clean.write.mode("overwrite").parquet(f"{output}/clean_stops.parquet")
+        model_stops.write.mode("overwrite").parquet(f"{output}/model_stops.parquet")
         conflicting.write.mode("overwrite").parquet(f"{output}/review_duplicates.parquet")
         invalid.write.mode("overwrite").parquet(f"{output}/invalid_keys.parquet")
 
@@ -151,7 +192,7 @@ def main():
                 "Quarantine missing or invalid logical keys",
                 "Remove identical records, preserving one copy",
                 "Quarantine all conflicting records sharing the same logical key",
-                "Keep missing delay values, cancellations and skipped stops for later filtering",
+                "Keep missing delay values, cancellations and skipped stops in clean_stops for analysis",
                 "Preserve negative and extreme delays; do not clip or impute them",
                 "Do not treat predicted arrival times as verified actual arrivals",
             ],
@@ -163,7 +204,36 @@ def main():
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n",
                                encoding="utf-8")
 
+        model_report = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "input_dataset": f"{output}/clean_stops.parquet",
+            "output_dataset": f"{output}/model_stops.parquet",
+            "starting_clean_rows": clean_rows,
+            "excluded_trip_status_not_scheduled": excluded_trip_status,
+            "excluded_skipped_stops": excluded_skipped,
+            "excluded_non_feed_delay_source": excluded_delay_source,
+            "include_propagated": args.include_propagated,
+            "outlier_threshold_abs_minutes": threshold,
+            "outliers_are_flagged_not_removed": True,
+            "model_statistics": model_stats,
+            "notes": [
+                "model_stops is an intermediate dataset, not final training pairs",
+                "Missing delay values remain until the next-stop label is constructed",
+                "Source-reported delays may be predictions rather than verified actual arrival times",
+                "Outliers are flagged but retained",
+            ],
+        }
+        model_report_path = output_path / "model_filter_report.json"
+        model_report_path.write_text(json.dumps(model_report, indent=2, ensure_ascii=False, default=str) + "\n",
+                                     encoding="utf-8")
+
         LOG.info("Clean records: %s", clean_rows)
+        LOG.info("Model stop records: %s", model_rows)
+        LOG.info("Model exclusions - train status: %s; skipped stop: %s; non-feed delay source: %s",
+                 excluded_trip_status, excluded_skipped, excluded_delay_source)
+        LOG.info("Outliers flagged - arrival: %s; departure: %s; threshold: +/-%.1f min",
+                 model_stats["arrival_outlier_rows"], model_stats["departure_outlier_rows"], threshold)
+        LOG.info("Model report: %s", model_report_path)
         LOG.info("Exact duplicate rows removed: %s", exact_duplicates_removed)
         LOG.info("Invalid-key records quarantined: %s", invalid_rows)
         LOG.info("Conflicting keys: %s; records quarantined: %s", conflicting_key_count, conflicting_rows)
