@@ -68,6 +68,9 @@ def main():
     parser.add_argument("--output", default="/opt/project/data/clean/stop_pairs.parquet")
     parser.add_argument("--master", default=os.environ.get("SPARK_MASTER", "local[*]"))
     args = parser.parse_args()
+    # "overwrite" deletes the output first, so it must never be the input.
+    if os.path.abspath(args.output) == os.path.abspath(args.input):
+        parser.error("--output must be different from --input")
 
     # Connect to Spark. UTC keeps Spark from shifting times between time zones.
     spark = (SparkSession.builder.appName("RailPredict-Build-Pairs")

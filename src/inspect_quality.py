@@ -1,3 +1,9 @@
+"""Check the quality of the raw data. It only prints results and changes nothing.
+
+Run from the repository root:
+  docker compose exec jupyter /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/project/src/inspect_quality.py
+"""
+
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
 
@@ -10,10 +16,12 @@ spark = (
 
 df = spark.read.parquet("/opt/project/data/dirty")
 
+# These three columns together identify one stop of one trip.
 keys = ["service_date", "trip_id", "stop_sequence"]
 
 print("\n1. DUPLICATE KEYS")
 
+# Stops that appear more than once, and whether their delays differ.
 duplicates = (
     df.groupBy(*keys)
     .agg(
@@ -31,6 +39,7 @@ duplicates.groupBy(
 
 print("\n2. DELAY PREDICTION CONSISTENCY")
 
+# Is the delay equal to (predicted arrival - scheduled arrival)?
 check = (
     df.withColumn(
         "scheduled_ts",
@@ -65,6 +74,7 @@ check.select(
 
 print("\n3. STATUSES AND MISSING DELAY VALUES")
 
+# How often delays are missing for each kind of record.
 df.groupBy(
     "trip_status", "stop_status", "delay_source"
 ).agg(
@@ -76,6 +86,7 @@ df.groupBy(
 
 print("\n4. CONSECUTIVE STATION PAIRS")
 
+# How many pairs of neighbouring stops can be built from non-duplicated rows.
 w = Window.partitionBy(
     "service_date", "trip_id"
 ).orderBy("stop_sequence")

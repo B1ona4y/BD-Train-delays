@@ -1,7 +1,8 @@
 """Create model features from pairs of consecutive stops.
 
 Input:  data/clean/stop_pairs.parquet    (created by build_pairs.py)
-        data/clean/clean_stops.parquet   (created by clean_data.py)
+        data/clean/clean_stops.parquet        (created by clean_data.py)
+        data/clean/review_duplicates.parquet  (created by clean_data.py)
 Output: data/clean/features.parquet      One row per pair: 14 features + target
 
 Text features stay as text and missing numbers stay empty.
@@ -55,11 +56,13 @@ def add_station_features(df):
 
 def find_trip_ends(stops):
     """Find the first and last station of every trip."""
-    # Use all clean stops: model_stops has some stops removed.
-    # min_by / max_by take the station with the lowest / highest stop number.
+    # Compare (stop number, stop_id) together: the smallest pair is the first stop,
+    # the largest is the last one. If a stop number appears twice, the result
+    # is still the same on every run.
+    stop = F.struct("stop_sequence", "stop_id")
     ends = stops.groupBy(*TRIP_COLUMNS).agg(
-        F.min_by("stop_id", "stop_sequence").alias("first_stop_id"),
-        F.max_by("stop_id", "stop_sequence").alias("last_stop_id"),
+        F.min(stop).getField("stop_id").alias("first_stop_id"),
+        F.max(stop).getField("stop_id").alias("last_stop_id"),
     )
     return ends.select(
         *TRIP_COLUMNS,
@@ -108,9 +111,14 @@ def main():
     parser = argparse.ArgumentParser(description="Create model features using Spark")
     parser.add_argument("--pairs", default="/opt/project/data/clean/stop_pairs.parquet")
     parser.add_argument("--stops", default="/opt/project/data/clean/clean_stops.parquet")
+    parser.add_argument("--duplicates", default="/opt/project/data/clean/review_duplicates.parquet")
     parser.add_argument("--output", default="/opt/project/data/clean/features.parquet")
     parser.add_argument("--master", default=os.environ.get("SPARK_MASTER", "local[*]"))
     args = parser.parse_args()
+    # "overwrite" deletes the output first, so it must never be an input.
+    inputs = [args.pairs, args.stops, args.duplicates]
+    if os.path.abspath(args.output) in map(os.path.abspath, inputs):
+        parser.error("--output must be different from the input paths")
 
     # Connect to Spark. Use the same time zone as the earlier scripts.
     spark = (SparkSession.builder.appName("RailPredict-Build-Features")
@@ -121,7 +129,13 @@ def main():
 
     try:
         pairs = spark.read.parquet(args.pairs)
-        stops = spark.read.parquet(args.stops)
+        # For the first and last station we need the full route of a trip:
+        # model_stops has some stops removed, and clean_stops does not include
+        # conflicting duplicates. Their records differ in times and delays,
+        # but they still show which station the trip visits.
+        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id"]
+        stops = (spark.read.parquet(args.stops).select(*columns)
+                 .unionByName(spark.read.parquet(args.duplicates).select(*columns)))
         pair_rows = pairs.count()
 
         # Add the first and last station to every pair.
