@@ -29,6 +29,11 @@ def build_pairs(stops):
     def next_value(name):
         return F.lead(name).over(trip_order)
 
+    # Take a value from an earlier row (an earlier stop) of the same trip.
+    # For the first stops of a trip there is no such row, so the result is empty.
+    def previous_value(name, steps):
+        return F.lag(name, steps).over(trip_order)
+
     # Put the current stop (N) and the next stop (N+1) into one row.
     # As model data, take from stop N+1 only what is known in advance, plus the target.
     joined = stops.select(
@@ -44,6 +49,12 @@ def build_pairs(stops):
         "departure_delay_min",
         "arrival_delay_outlier",
         "departure_delay_outlier",
+        # Data about earlier stops N-1 and N-3: the train has already passed them.
+        # Their numbers are needed to check that no stop is missing in between.
+        previous_value("stop_sequence", 1).alias("prev_stop_sequence"),
+        previous_value("departure_delay_min", 1).alias("prev_departure_delay_min"),
+        previous_value("stop_sequence", 3).alias("back3_stop_sequence"),
+        previous_value("departure_delay_min", 3).alias("back3_departure_delay_min"),
         # Data about the next stop N+1.
         # Its number is needed to check that the two stops are neighbours.
         next_value("stop_sequence").alias("next_stop_sequence"),
@@ -55,10 +66,21 @@ def build_pairs(stops):
         # For evaluating results only. It reveals the target, so never use it as a feature.
         next_value("arrival_delay_outlier").alias("target_outlier"),
     )
+    # Keep an earlier delay only if no stop is missing in between (for example 2 -> 4).
+    # Stop numbers in a trip are unique, so if the stop 3 rows back is N-3,
+    # the rows in between are exactly N-2 and N-1.
+    stop = F.col("stop_sequence")
+    joined = (joined
+              .withColumn("prev_departure_delay_min",
+                          F.when(F.col("prev_stop_sequence") == stop - 1, F.col("prev_departure_delay_min")))
+              .withColumn("back3_departure_delay_min",
+                          F.when(F.col("back3_stop_sequence") == stop - 3, F.col("back3_departure_delay_min")))
+              .drop("prev_stop_sequence", "back3_stop_sequence"))
+
     # Keep a row only if the next number is the current number + 1.
     # A gap (for example 3 -> 5) means a stop is missing, so it is not a pair.
     # The last stop of each trip is also dropped here, because it has no next stop.
-    return joined.filter(F.col("next_stop_sequence") == F.col("stop_sequence") + 1)
+    return joined.filter(F.col("next_stop_sequence") == stop + 1)
 
 
 def main():

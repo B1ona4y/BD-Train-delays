@@ -3,7 +3,7 @@
 Input:  data/clean/stop_pairs.parquet    (created by build_pairs.py)
         data/clean/clean_stops.parquet        (created by clean_data.py)
         data/clean/review_duplicates.parquet  (created by clean_data.py)
-Output: data/clean/features.parquet      One row per pair: 14 features + target
+Output: data/clean/features.parquet      One row per pair: features + target
 
 Text features stay as text and missing numbers stay empty.
 Both will be handled later in the MLlib Pipeline.
@@ -29,6 +29,8 @@ NUMERIC_FEATURES = [
     "is_bus", "stop_sequence", "departure_hour", "day_of_week",
     "scheduled_travel_min", "scheduled_dwell_min",
     "arrival_delay_min", "departure_delay_min",
+    # Trip history: how the delay of this train changed before it leaves stop N.
+    "prev_hop_delay_change", "dwell_delay_change", "delay_change_3_stops",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -106,6 +108,24 @@ def add_schedule_features(df):
                         minutes_between("scheduled_arrival", "scheduled_departure")))
 
 
+def add_trip_history_features(df):
+    """Show how the delay of this train changed at the stops it has already passed.
+
+    A train that is losing minutes now will probably keep losing them.
+    Empty when an earlier stop or delay is missing: empty is not the same as "no change".
+    """
+    return (df
+            # Minutes lost on the previous hop N-1 -> N (minus = time made up)
+            .withColumn("prev_hop_delay_change",
+                        F.col("arrival_delay_min") - F.col("prev_departure_delay_min"))
+            # Minutes lost while standing at stop N
+            .withColumn("dwell_delay_change",
+                        F.col("departure_delay_min") - F.col("arrival_delay_min"))
+            # Minutes lost over the last 3 hops, from leaving N-3 to leaving N
+            .withColumn("delay_change_3_stops",
+                        F.col("departure_delay_min") - F.col("back3_departure_delay_min")))
+
+
 def main():
     # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Create model features using Spark")
@@ -144,6 +164,7 @@ def main():
         df = add_station_features(df)
         df = add_route_features(df)
         df = add_schedule_features(df)
+        df = add_trip_history_features(df)
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
