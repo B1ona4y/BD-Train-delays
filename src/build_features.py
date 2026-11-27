@@ -8,12 +8,16 @@ Output: data/clean/features.parquet      One row per pair: features + target
 Text features stay as text and missing numbers stay empty.
 Both will be handled later in the MLlib Pipeline.
 
+The typical behaviour of hops is learned from days up to --stats-end (default 2026-11-20).
+If you change the dates of the split in notebooks/model.ipynb, change --stats-end too.
+
 Run from the repository root:
   docker compose exec jupyter /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/project/src/build_features.py
 """
 
 import argparse
 import os
+from datetime import date
 
 from pyspark.sql import SparkSession, functions as F
 
@@ -36,6 +40,8 @@ NUMERIC_FEATURES = [
     "station_recent_trains", "station_recent_dwell_change",
     # Network load: how many trains the timetable plans at stop N in this hour.
     "station_trains_per_hour",
+    # Typical behaviour of the hop N -> N+1 on other days.
+    "edge_history_hops", "edge_typical_delay_change", "edge_share_gain_3min",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -47,6 +53,14 @@ ROW_KEY = TRIP_COLUMNS + ["stop_sequence"]
 
 # How far back to look at other trains, in minutes.
 RECENT_MINUTES = 60
+
+# The typical behaviour of a hop is learned only from days up to this date.
+# It is the last "fit" day in notebooks/model.ipynb: validation and test days stay unseen.
+STATS_END = "2026-11-20"
+# With fewer hops on other days, an average is just noise, so it stays empty.
+MIN_HISTORY_HOPS = 10
+# A hop where the train loses at least this many minutes counts as a "gain" of delay.
+GAIN_MINUTES = 3
 
 # These columns are saved too, but they are NOT features.
 # service_date: train/test split. trip_id: checks. target_outlier: evaluating results.
@@ -235,6 +249,45 @@ def add_network_load_features(df, stops):
             .drop("hour"))
 
 
+def add_edge_history_features(df, stats_end):
+    """Describe how the hop N -> N+1 usually behaves: how many minutes trains lose on it.
+
+    Two rules keep the target hidden:
+    - only days up to stats_end are used, so validation and test days are never seen;
+    - a row never uses its own day, otherwise its own target would be in the average.
+    """
+    edge = ["station_id", "next_station_id"]
+    change = F.col(TARGET) - F.col("departure_delay_min")
+
+    # Sums per hop and day. Sums (not averages) are used, so that one day can be subtracted later.
+    per_day = (df.filter((F.col("service_date") <= F.to_date(F.lit(stats_end))) & change.isNotNull())
+               .groupBy(*edge, "service_date")
+               .agg(F.count("*").alias("day_hops"),
+                    F.sum(change).alias("day_change"),
+                    F.sum((change >= GAIN_MINUTES).cast("long")).alias("day_gains")))
+    totals = per_day.groupBy(*edge).agg(
+        F.sum("day_hops").alias("all_hops"),
+        F.sum("day_change").alias("all_change"),
+        F.sum("day_gains").alias("all_gains"),
+    )
+
+    def without_own_day(name):
+        # Total over all days minus the row's own day (0 if that day is not used at all).
+        return F.coalesce(F.col(f"all_{name}"), F.lit(0)) - F.coalesce(F.col(f"day_{name}"), F.lit(0))
+
+    hops = without_own_day("hops")
+    enough = hops >= MIN_HISTORY_HOPS
+    return (df.join(totals, edge, "left")
+            .join(per_day, edge + ["service_date"], "left")
+            # Number of hops on other days the averages are based on
+            .withColumn("edge_history_hops", hops)
+            # Average minutes lost on this hop
+            .withColumn("edge_typical_delay_change", F.when(enough, without_own_day("change") / hops))
+            # Share of trains that lost at least GAIN_MINUTES on this hop
+            .withColumn("edge_share_gain_3min", F.when(enough, without_own_day("gains") / hops))
+            .drop("all_hops", "all_change", "all_gains", "day_hops", "day_change", "day_gains"))
+
+
 def main():
     # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Create model features using Spark")
@@ -243,6 +296,8 @@ def main():
     parser.add_argument("--duplicates", default="/opt/project/data/clean/review_duplicates.parquet")
     parser.add_argument("--output", default="/opt/project/data/clean/features.parquet")
     parser.add_argument("--master", default=os.environ.get("SPARK_MASTER", "local[*]"))
+    parser.add_argument("--stats-end", default=STATS_END, type=date.fromisoformat,
+                        help="Last day (YYYY-MM-DD) used to learn the typical behaviour of hops")
     args = parser.parse_args()
     # "overwrite" deletes the output first, so it must never be an input.
     inputs = [args.pairs, args.stops, args.duplicates]
@@ -277,6 +332,7 @@ def main():
         df = add_trip_history_features(df)
         df = add_recent_traffic_features(df)
         df = add_network_load_features(df, stops)
+        df = add_edge_history_features(df, args.stats_end.isoformat())
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
