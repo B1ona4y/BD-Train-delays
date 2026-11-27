@@ -39,6 +39,8 @@ Afterwards choose **Kernel → Shut Down Kernel**, otherwise the next Spark job 
 Results are saved in `data/clean/`. If you rerun a step, rerun all the steps after it.
 To stop the containers: `docker compose down`.
 
+Design decisions and the reasons behind them are described in [docs/decisions.md](docs/decisions.md).
+
 ## To be continued...
 
 The data is ready: one row is one hop between two stations, and the goal is the arrival delay at the next one.
