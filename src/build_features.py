@@ -31,11 +31,20 @@ NUMERIC_FEATURES = [
     "arrival_delay_min", "departure_delay_min",
     # Trip history: how the delay of this train changed before it leaves stop N.
     "prev_hop_delay_change", "dwell_delay_change", "delay_change_3_stops",
+    # Other trains in the last hour: on the same hop N -> N+1 and at the same stop N.
+    "edge_recent_trains", "edge_recent_delay_change",
+    "station_recent_trains", "station_recent_dwell_change",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 # The value the model will learn to predict.
 TARGET = "target_next_arrival_delay_min"
+
+# One stop of one trip: identifies every row of the pairs.
+ROW_KEY = TRIP_COLUMNS + ["stop_sequence"]
+
+# How far back to look at other trains, in minutes.
+RECENT_MINUTES = 60
 
 # These columns are saved too, but they are NOT features.
 # service_date: train/test split. trip_id: checks. target_outlier: evaluating results.
@@ -126,6 +135,80 @@ def add_trip_history_features(df):
                         F.col("departure_delay_min") - F.col("back3_departure_delay_min")))
 
 
+def real_time_seconds(planned_column, delay_column):
+    """When something really happened: planned time + delay, in seconds."""
+    return F.unix_timestamp(planned_column) + delay_column * 60
+
+
+def recent_events(rows, events, place_columns, count_name, average_name):
+    """Count and average events of OTHER trains at the same place in the last hour.
+
+    rows:   ROW_KEY + place_columns + "now"           (seconds)
+    events: TRIP_COLUMNS + place_columns + "known_at" (seconds) + "value"
+    An event is used only if it happened before "now": the model may not see the future.
+    """
+    window = RECENT_MINUTES * 60
+    # Compare only events from the same hour slot or the slot before,
+    # so Spark does not compare every train with every other train.
+    slot = F.floor(F.col("now") / window)
+    rows = rows.withColumn("slot", F.explode(F.array(slot, slot - 1)))
+    events = (events
+              .withColumn("slot", F.floor(F.col("known_at") / window))
+              .withColumnRenamed("service_date", "event_service_date")
+              .withColumnRenamed("trip_id", "event_trip_id"))
+
+    same_train = ((F.col("event_service_date") == F.col("service_date")) &
+                  (F.col("event_trip_id") == F.col("trip_id")))
+    recent = (rows.join(events, place_columns + ["slot"])
+              .filter((F.col("known_at") >= F.col("now") - window) &
+                      (F.col("known_at") < F.col("now")) &
+                      ~same_train))
+    return recent.groupBy(*ROW_KEY).agg(
+        F.count("value").alias(count_name),
+        F.avg("value").alias(average_name),
+    )
+
+
+def add_recent_traffic_features(df):
+    """Describe what happened to other trains here in the last hour.
+
+    There is no data about the causes of delays, but a problem on the line
+    (a breakdown, works, a slow train ahead) shows up in the delays of other trains.
+    """
+    # "Now" is when our train really leaves stop N. If its departure delay
+    # is unknown, use the arrival delay, or the timetable if both are empty.
+    our_delay = F.coalesce(F.col("departure_delay_min"), F.col("arrival_delay_min"), F.lit(0.0))
+    rows = df.select(*ROW_KEY, "station_id", "next_station_id",
+                     real_time_seconds("scheduled_departure", our_delay).alias("now"))
+
+    # Hop N -> N+1: other trains that already arrived at N+1,
+    # and how many minutes they lost on this hop.
+    hop_events = df.select(
+        *TRIP_COLUMNS, "station_id", "next_station_id",
+        real_time_seconds("next_scheduled_arrival", F.col(TARGET)).alias("known_at"),
+        (F.col(TARGET) - F.col("departure_delay_min")).alias("value"),
+    )
+    # Stop N: other trains that already left N, and how many minutes they lost while standing there.
+    stop_events = df.select(
+        *TRIP_COLUMNS, "station_id",
+        real_time_seconds("scheduled_departure", F.col("departure_delay_min")).alias("known_at"),
+        (F.col("departure_delay_min") - F.col("arrival_delay_min")).alias("value"),
+    )
+
+    edge = recent_events(rows, hop_events.dropna(subset=["known_at", "value"]),
+                         ["station_id", "next_station_id"],
+                         "edge_recent_trains", "edge_recent_delay_change")
+    station = recent_events(rows.drop("next_station_id"),
+                            stop_events.dropna(subset=["known_at", "value"]),
+                            ["station_id"],
+                            "station_recent_trains", "station_recent_dwell_change")
+
+    # No other trains means a count of 0. The average stays empty: there is nothing to average.
+    return (df.join(edge, ROW_KEY, "left")
+            .join(station, ROW_KEY, "left")
+            .fillna(0, subset=["edge_recent_trains", "station_recent_trains"]))
+
+
 def main():
     # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Create model features using Spark")
@@ -165,6 +248,7 @@ def main():
         df = add_route_features(df)
         df = add_schedule_features(df)
         df = add_trip_history_features(df)
+        df = add_recent_traffic_features(df)
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
