@@ -39,8 +39,8 @@ NUMERIC_FEATURES = [
     # Other trains in the last hour: on the same hop N -> N+1 and at the same stop N.
     "edge_recent_trains", "edge_recent_delay_change",
     "station_recent_trains", "station_recent_dwell_change",
-    # Network load: how many trains the timetable plans at stop N in this hour.
-    "station_trains_per_hour",
+    # Network load: how many trains the timetable plans at stop N in this hour and on this day.
+    "station_trains_per_hour", "station_trains_per_day",
     # Typical behaviour of the hop N -> N+1 on other days.
     "edge_history_hops", "edge_typical_delay_change", "edge_share_gain_3min",
     # Position in the trip: how many stops are left until the last one.
@@ -299,21 +299,28 @@ def planned_hour(df):
 
 
 def add_network_load_features(df, stops):
-    """Count how many different trains the timetable plans at stop N in the same hour.
+    """Count how many different trains the timetable plans at stop N in the same hour and day.
 
     A busy station has more trains waiting for each other and for free platforms.
+    Trains per day also show how big the station is: big stations have more passengers.
     The timetable is known in advance, so this does not reveal the target.
-    Our own train is counted too, so the value is at least 1.
+    Our own train is counted too, so the values are at least 1.
     """
-    load = (stops
-            .select(*TRIP_COLUMNS,
-                    to_station_id("stop_id").alias("station_id"),
-                    planned_hour(stops).alias("hour"))
-            .dropna(subset=["station_id", "hour"])
-            .groupBy("station_id", "hour")
-            .agg(F.countDistinct(*TRIP_COLUMNS).alias("station_trains_per_hour")))
+    stations = stops.select(*TRIP_COLUMNS,
+                            to_station_id("stop_id").alias("station_id"),
+                            planned_hour(stops).alias("hour"))
+    per_hour = (stations
+                .dropna(subset=["station_id", "hour"])
+                .groupBy("station_id", "hour")
+                .agg(F.countDistinct(*TRIP_COLUMNS).alias("station_trains_per_hour")))
+    # A day is the service day of the train, as in the rest of the data.
+    per_day = (stations
+               .dropna(subset=["station_id"])
+               .groupBy("station_id", "service_date")
+               .agg(F.countDistinct("trip_id").alias("station_trains_per_day")))
     return (df.withColumn("hour", planned_hour(df))
-            .join(load, ["station_id", "hour"], "left")
+            .join(per_hour, ["station_id", "hour"], "left")
+            .join(per_day, ["station_id", "service_date"], "left")
             .drop("hour"))
 
 
