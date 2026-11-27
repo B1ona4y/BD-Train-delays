@@ -46,7 +46,7 @@ NUMERIC_FEATURES = [
     # Position in the trip: how many stops are left until the last one.
     "stops_to_end",
     # Passenger demand (there is no data about the number of passengers).
-    "is_commuter_peak", "at_big_city",
+    "is_commuter_peak", "at_big_city", "to_big_city",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -99,19 +99,21 @@ def add_station_features(df):
 
 
 def find_trip_ends(stops):
-    """Find the first and last station of every trip."""
+    """Find the first and last station of every trip, and the name of the last one."""
     # Compare (stop number, stop_id) together: the smallest pair is the first stop,
     # the largest is the last one. If a stop number appears twice, the result
-    # is still the same on every run.
-    stop = F.struct("stop_sequence", "stop_id")
+    # is still the same on every run. One stop_id always has one name,
+    # so adding the name does not change which stop is chosen.
+    stop = F.struct("stop_sequence", "stop_id", "stop_name")
     ends = stops.groupBy(*TRIP_COLUMNS).agg(
         F.min(stop).getField("stop_id").alias("first_stop_id"),
-        F.max(stop).getField("stop_id").alias("last_stop_id"),
+        F.max(stop).alias("last_stop"),
     )
     return ends.select(
         *TRIP_COLUMNS,
         to_station_id("first_stop_id").alias("first_station_id"),
-        to_station_id("last_stop_id").alias("last_station_id"),
+        to_station_id("last_stop.stop_id").alias("last_station_id"),
+        F.col("last_stop.stop_name").alias("last_stop_name"),
     )
 
 
@@ -188,8 +190,15 @@ def is_big_city(name_column):
 
 
 def add_big_city_features(df):
-    """Mark stops in big cities: many people get on and off there, so stops take longer."""
-    return df.withColumn("at_big_city", is_big_city("stop_name"))
+    """Mark stops in big cities and trains going to a big city.
+
+    Many people get on and off in big cities, so stops take longer there.
+    Trains going to a big city fill up along the way, for example on Sunday
+    evening, when people return to Warsaw for work.
+    """
+    return (df
+            .withColumn("at_big_city", is_big_city("stop_name"))
+            .withColumn("to_big_city", is_big_city("last_stop_name")))
 
 
 def add_trip_history_features(df):
@@ -380,8 +389,10 @@ def main():
         # model_stops has some stops removed, and clean_stops does not include
         # conflicting duplicates. Their records differ in times and delays,
         # but they still show which station the trip visits and when.
-        # The planned times are needed to count trains per station and hour.
-        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id", "scheduled_arrival", "scheduled_departure"]
+        # The planned times are needed to count trains per station and hour,
+        # the names to find trains going to a big city.
+        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id", "stop_name",
+                                  "scheduled_arrival", "scheduled_departure"]
         stops = (spark.read.parquet(args.stops).select(*columns)
                  .unionByName(spark.read.parquet(args.duplicates).select(*columns)))
         pair_rows = pairs.count()
