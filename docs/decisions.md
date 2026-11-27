@@ -1,5 +1,8 @@
 # Design decisions
 
+1. [Broadcast joins are disabled in `build_features.py`](#1-broadcast-joins-are-disabled-in-build_featurespy)
+2. [Train and test are split by date, not randomly](#2-train-and-test-are-split-by-date-not-randomly)
+
 Known limitations of the data are listed at the end, in [Known limitations](#known-limitations).
 
 ## 1. Broadcast joins are disabled in `build_features.py`
@@ -48,6 +51,47 @@ In our case step 5 takes about 1.5 minutes for 1.1 million pairs, which is accep
   (compared row by row with pandas).
 - The setting only changes **how** Spark joins, not **what** it joins,
   so the features are the same as with broadcast joins.
+
+## 2. Train and test are split by date, not randomly
+
+**Decision.** `notebooks/model.ipynb` splits the pairs by `service_date`:
+
+| Part | Dates | Used for |
+|---|---|---|
+| fit | 17–22 Nov | training model variants |
+| validation | 23 Nov | comparing the variants |
+| test | 24–26 Nov | the final check only |
+
+`build_features.py --stats-end` is set to 22 Nov, the last fit day (see below).
+
+### Why not a random split
+1. **Neighbouring rows of one trip are almost the same.** One row is one hop of one train.
+   The current delay in row N+1 is exactly the target of row N. With a random split,
+   row N+1 can be in train and row N in test, so the test checks memory, not prediction.
+2. **Rows of one day share events.** A breakdown, works or bad weather affects many trains
+   on the same day. With a random split the model would already "know" that day in the test.
+3. **Some features look only into the past.** The recent traffic features use other trains of the
+   last hour, and the edge history uses whole earlier days. With a random split, targets of test rows
+   would end up in features of training rows.
+4. **The real task is a forecast.** A model is trained on past days and used on the next day.
+   A split by date checks exactly this.
+
+Dropping `day_of_week` would not help: the rows stay connected through the trip and the day.
+
+### Why these dates
+After the data grew to 10 days (17–26 Nov), the old dates (test 22–23 Nov) would have put
+all new days into the test, so it would be half of the data. The new dates keep about
+60% / 10% / 30% of the rows for fit / validation / test.
+
+### What `--stats-end` has to do with it
+The edge history features (`edge_typical_delay_change`, `edge_share_gain_3min`, `edge_history_hops`)
+are learned from days up to `--stats-end`. It must be the last **fit** day: then neither the
+validation day nor the test days are used to build features. A row also never uses its own day.
+
+### Limitation
+17 Nov 2026 is a Tuesday, so each day of the week appears only once or twice.
+The validation day (23 Nov) is the only Monday, and validation and test have no weekend days.
+Features that depend on the day of the week (`day_of_week`) cannot be checked well with this data.
 
 ## Known limitations
 

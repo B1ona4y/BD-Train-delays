@@ -8,7 +8,7 @@ Output: data/clean/features.parquet      One row per pair: features + target
 Text features stay as text and missing numbers stay empty.
 Both will be handled later in the MLlib Pipeline.
 
-The typical behaviour of hops is learned from days up to --stats-end (default 2026-11-20).
+The typical behaviour of hops is learned from days up to --stats-end (default 2026-11-22).
 If you change the dates of the split in notebooks/model.ipynb, change --stats-end too.
 
 Run from the repository root:
@@ -61,7 +61,7 @@ RECENT_MINUTES = 60
 
 # The typical behaviour of a hop is learned only from days up to this date.
 # It is the last "fit" day in notebooks/model.ipynb: validation and test days stay unseen.
-STATS_END = "2026-11-20"
+STATS_END = "2026-11-22"
 # With fewer hops on other days, an average is just noise, so it stays empty.
 MIN_HISTORY_HOPS = 10
 # A hop where the train loses at least this many minutes counts as a "gain" of delay.
