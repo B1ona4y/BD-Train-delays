@@ -20,6 +20,7 @@ import os
 from datetime import date
 
 from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
 
 TRIP_COLUMNS = ["service_date", "trip_id"]
 
@@ -42,6 +43,8 @@ NUMERIC_FEATURES = [
     "station_trains_per_hour",
     # Typical behaviour of the hop N -> N+1 on other days.
     "edge_history_hops", "edge_typical_delay_change", "edge_share_gain_3min",
+    # Position in the trip: how many stops are left until the last one.
+    "stops_to_end",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -96,6 +99,19 @@ def find_trip_ends(stops):
         to_station_id("first_stop_id").alias("first_station_id"),
         to_station_id("last_stop_id").alias("last_station_id"),
     )
+
+
+def add_trip_position_features(df, stops):
+    """Count how many stops of the timetable come after stop N (known in advance).
+
+    The value is 1 when N+1 is the last stop. The stops are counted, not their numbers
+    subtracted: some international trains end with an extra stop numbered 1000 or more.
+    """
+    # One row per stop number: a conflicting duplicate has two rows with the same number.
+    numbers = stops.select(*ROW_KEY).distinct()
+    from_the_end = Window.partitionBy(*TRIP_COLUMNS).orderBy(F.desc("stop_sequence"))
+    stops_left = numbers.withColumn("stops_to_end", F.row_number().over(from_the_end) - 1)
+    return df.join(stops_left, ROW_KEY, "left")
 
 
 def add_route_features(df):
@@ -337,6 +353,7 @@ def main():
         df = add_recent_traffic_features(df)
         df = add_network_load_features(df, stops)
         df = add_edge_history_features(df, args.stats_end.isoformat())
+        df = add_trip_position_features(df, stops)
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
