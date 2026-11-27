@@ -1,5 +1,7 @@
 # Design decisions
 
+Known limitations of the data are listed at the end, in [Known limitations](#known-limitations).
+
 ## 1. Broadcast joins are disabled in `build_features.py`
 
 **Decision.** `build_features.py` starts Spark with
@@ -46,3 +48,32 @@ In our case step 5 takes about 1.5 minutes for 1.1 million pairs, which is accep
   (compared row by row with pandas).
 - The setting only changes **how** Spark joins, not **what** it joins,
   so the features are the same as with broadcast joins.
+
+## Known limitations
+
+### L1. Wrong last station for some international trains
+
+**What is wrong.** Some international PKP Intercity trains (between Poland and Germany or Czechia)
+end with an extra row that is not a real stop. Example: a train from Berlin to Warsaw, 17 Nov:
+
+| stop_sequence | stop_name | Planned time | Delay |
+|---|---|---|---|
+| 9 | Warszawa Centralna | 13:00 | −3 |
+| 10 | **Warszawa Wschodnia** (real last stop) | 13:15 | −2 |
+| 1000 | Frankfurt (Oder) | none | none |
+
+The extra row has no planned times and no delays, its `stop_sequence` is 1000 or more,
+and its `stop_id` ends with `_FALLBACK`. It looks like a technical record of the data source.
+In the data for 17–26 Nov there are 17 such rows: 7 trains, 17 train runs.
+
+**What it affects.** `build_features.py` takes the stop with the highest number as the last one, so for these runs:
+- `last_station_id` points to the extra row (for example Frankfurt instead of Warsaw);
+- `to_big_city` can be 0 although the train goes to Warsaw;
+- `stops_to_end` is one stop too large.
+
+**Why it is not fixed yet.** Only 9 of 1,115,191 feature rows belong to these runs
+(most of their stops do not form pairs), so the effect on the model is negligible.
+
+**How to fix it later.** In `clean_data.py`, set aside rows that have neither a planned arrival
+nor a planned departure, because such a row is not a real stop. Before doing this, check the other
+194 rows without planned times: they have no `stop_id` and no `stop_name`, so they are a different case.
