@@ -46,7 +46,7 @@ NUMERIC_FEATURES = [
     # Position in the trip: how many stops are left until the last one.
     "stops_to_end",
     # Passenger demand (there is no data about the number of passengers).
-    "is_commuter_peak",
+    "is_commuter_peak", "at_big_city",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -69,6 +69,15 @@ GAIN_MINUTES = 3
 
 # Hours when people travel to and from work: [start, end), on working days.
 COMMUTER_PEAK_HOURS = [(6, 9), (15, 18)]
+
+# The 12 largest cities of Poland (more than about 240,000 people).
+# A station belongs to a city if its name starts with the city name:
+# "Warszawa Wschodnia" is in Warsaw, but "Szczecinek" is not in Szczecin.
+BIG_CITIES = [
+    "Warszawa", "Kraków", "Wrocław", "Łódź", "Poznań", "Gdańsk",
+    "Szczecin", "Lublin", "Bydgoszcz", "Białystok", "Katowice", "Gdynia",
+]
+BIG_CITY_PATTERN = "^(" + "|".join(BIG_CITIES) + ")( |$)"
 
 # These columns are saved too, but they are NOT features.
 # service_date: train/test split. trip_id: checks. target_outlier: evaluating results.
@@ -170,6 +179,17 @@ def add_commuter_peak_feature(df):
     # Without a departure time it is unknown, so it stays empty.
     return df.withColumn("is_commuter_peak",
                          F.when(hour.isNotNull(), (working_day & in_peak).cast("int")))
+
+
+def is_big_city(name_column):
+    """1 if the station is in a big city, 0 if not, empty if the name is unknown."""
+    name = F.col(name_column)
+    return F.when(name.isNotNull(), name.rlike(BIG_CITY_PATTERN).cast("int"))
+
+
+def add_big_city_features(df):
+    """Mark stops in big cities: many people get on and off there, so stops take longer."""
+    return df.withColumn("at_big_city", is_big_city("stop_name"))
 
 
 def add_trip_history_features(df):
@@ -373,6 +393,7 @@ def main():
         df = add_route_features(df)
         df = add_schedule_features(df)
         df = add_commuter_peak_feature(df)
+        df = add_big_city_features(df)
         df = add_trip_history_features(df)
         df = add_recent_traffic_features(df)
         df = add_network_load_features(df, stops)
