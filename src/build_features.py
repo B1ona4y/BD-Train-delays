@@ -3,10 +3,13 @@
 Input:  data/clean/stop_pairs.parquet    (created by build_pairs.py)
         data/clean/clean_stops.parquet        (created by clean_data.py)
         data/clean/review_duplicates.parquet  (created by clean_data.py)
-Output: data/clean/features.parquet      One row per pair: 14 features + target
+Output: data/clean/features.parquet      One row per pair: features + target
 
 Text features stay as text and missing numbers stay empty.
 Both will be handled later in the MLlib Pipeline.
+
+The typical behaviour of hops is learned from days up to --stats-end (default 2026-11-22).
+If you change the dates of the split in notebooks/model.ipynb, change --stats-end too.
 
 Run from the repository root:
   docker compose exec jupyter /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/project/src/build_features.py
@@ -14,8 +17,10 @@ Run from the repository root:
 
 import argparse
 import os
+from datetime import date
 
 from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
 
 TRIP_COLUMNS = ["service_date", "trip_id"]
 
@@ -29,11 +34,50 @@ NUMERIC_FEATURES = [
     "is_bus", "stop_sequence", "departure_hour", "day_of_week",
     "scheduled_travel_min", "scheduled_dwell_min",
     "arrival_delay_min", "departure_delay_min",
+    # Trip history: how the delay of this train changed before it leaves stop N.
+    "prev_hop_delay_change", "dwell_delay_change", "delay_change_3_stops",
+    # Other trains in the last hour: on the same hop N -> N+1 and at the same stop N.
+    "edge_recent_trains", "edge_recent_delay_change",
+    "station_recent_trains", "station_recent_dwell_change",
+    # Network load: how many trains the timetable plans at stop N in this hour and on this day.
+    "station_trains_per_hour", "station_trains_per_day",
+    # Typical behaviour of the hop N -> N+1 on other days.
+    "edge_history_hops", "edge_typical_delay_change", "edge_share_gain_3min",
+    # Position in the trip: how many stops are left until the last one.
+    "stops_to_end",
+    # Passenger demand (there is no data about the number of passengers).
+    "is_commuter_peak", "at_big_city", "to_big_city",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 # The value the model will learn to predict.
 TARGET = "target_next_arrival_delay_min"
+
+# One stop of one trip: identifies every row of the pairs.
+ROW_KEY = TRIP_COLUMNS + ["stop_sequence"]
+
+# How far back to look at other trains, in minutes.
+RECENT_MINUTES = 60
+
+# The typical behaviour of a hop is learned only from days up to this date.
+# It is the last "fit" day in notebooks/model.ipynb: validation and test days stay unseen.
+STATS_END = "2026-11-22"
+# With fewer hops on other days, an average is just noise, so it stays empty.
+MIN_HISTORY_HOPS = 10
+# A hop where the train loses at least this many minutes counts as a "gain" of delay.
+GAIN_MINUTES = 3
+
+# Hours when people travel to and from work: [start, end), on working days.
+COMMUTER_PEAK_HOURS = [(6, 9), (15, 18)]
+
+# The 12 largest cities of Poland (more than about 240,000 people).
+# A station belongs to a city if its name starts with the city name:
+# "Warszawa Wschodnia" is in Warsaw, but "Szczecinek" is not in Szczecin.
+BIG_CITIES = [
+    "Warszawa", "Kraków", "Wrocław", "Łódź", "Poznań", "Gdańsk",
+    "Szczecin", "Lublin", "Bydgoszcz", "Białystok", "Katowice", "Gdynia",
+]
+BIG_CITY_PATTERN = "^(" + "|".join(BIG_CITIES) + ")( |$)"
 
 # These columns are saved too, but they are NOT features.
 # service_date: train/test split. trip_id: checks. target_outlier: evaluating results.
@@ -55,20 +99,35 @@ def add_station_features(df):
 
 
 def find_trip_ends(stops):
-    """Find the first and last station of every trip."""
+    """Find the first and last station of every trip, and the name of the last one."""
     # Compare (stop number, stop_id) together: the smallest pair is the first stop,
     # the largest is the last one. If a stop number appears twice, the result
-    # is still the same on every run.
-    stop = F.struct("stop_sequence", "stop_id")
+    # is still the same on every run. One stop_id always has one name,
+    # so adding the name does not change which stop is chosen.
+    stop = F.struct("stop_sequence", "stop_id", "stop_name")
     ends = stops.groupBy(*TRIP_COLUMNS).agg(
         F.min(stop).getField("stop_id").alias("first_stop_id"),
-        F.max(stop).getField("stop_id").alias("last_stop_id"),
+        F.max(stop).alias("last_stop"),
     )
     return ends.select(
         *TRIP_COLUMNS,
         to_station_id("first_stop_id").alias("first_station_id"),
-        to_station_id("last_stop_id").alias("last_station_id"),
+        to_station_id("last_stop.stop_id").alias("last_station_id"),
+        F.col("last_stop.stop_name").alias("last_stop_name"),
     )
+
+
+def add_trip_position_features(df, stops):
+    """Count how many stops of the timetable come after stop N (known in advance).
+
+    The value is 1 when N+1 is the last stop. The stops are counted, not their numbers
+    subtracted: some international trains end with an extra stop numbered 1000 or more.
+    """
+    # One row per stop number: a conflicting duplicate has two rows with the same number.
+    numbers = stops.select(*ROW_KEY).distinct()
+    from_the_end = Window.partitionBy(*TRIP_COLUMNS).orderBy(F.desc("stop_sequence"))
+    stops_left = numbers.withColumn("stops_to_end", F.row_number().over(from_the_end) - 1)
+    return df.join(stops_left, ROW_KEY, "left")
 
 
 def add_route_features(df):
@@ -106,6 +165,204 @@ def add_schedule_features(df):
                         minutes_between("scheduled_arrival", "scheduled_departure")))
 
 
+def add_commuter_peak_feature(df):
+    """Mark departures in the morning and evening rush hours of working days.
+
+    In rush hours trains are full, and boarding takes longer.
+    The day is taken from the departure time itself, so a night train
+    after midnight gets the day it really leaves on.
+    """
+    hour = F.col("departure_hour")
+    # Spark numbering: 2 = Monday, ..., 6 = Friday
+    working_day = F.dayofweek("scheduled_departure").between(2, 6)
+    in_peak = F.lit(False)
+    for start, end in COMMUTER_PEAK_HOURS:
+        in_peak = in_peak | ((hour >= start) & (hour < end))
+    # Without a departure time it is unknown, so it stays empty.
+    return df.withColumn("is_commuter_peak",
+                         F.when(hour.isNotNull(), (working_day & in_peak).cast("int")))
+
+
+def is_big_city(name_column):
+    """1 if the station is in a big city, 0 if not, empty if the name is unknown."""
+    name = F.col(name_column)
+    return F.when(name.isNotNull(), name.rlike(BIG_CITY_PATTERN).cast("int"))
+
+
+def add_big_city_features(df):
+    """Mark stops in big cities and trains going to a big city.
+
+    Many people get on and off in big cities, so stops take longer there.
+    Trains going to a big city fill up along the way, for example on Sunday
+    evening, when people return to Warsaw for work.
+    """
+    return (df
+            .withColumn("at_big_city", is_big_city("stop_name"))
+            .withColumn("to_big_city", is_big_city("last_stop_name")))
+
+
+def add_trip_history_features(df):
+    """Show how the delay of this train changed at the stops it has already passed.
+
+    A train that is losing minutes now will probably keep losing them.
+    Empty when an earlier stop or delay is missing: empty is not the same as "no change".
+    """
+    return (df
+            # Minutes lost on the previous hop N-1 -> N (minus = time made up)
+            .withColumn("prev_hop_delay_change",
+                        F.col("arrival_delay_min") - F.col("prev_departure_delay_min"))
+            # Minutes lost while standing at stop N
+            .withColumn("dwell_delay_change",
+                        F.col("departure_delay_min") - F.col("arrival_delay_min"))
+            # Minutes lost over the last 3 hops, from leaving N-3 to leaving N
+            .withColumn("delay_change_3_stops",
+                        F.col("departure_delay_min") - F.col("back3_departure_delay_min")))
+
+
+def real_time_seconds(planned_column, delay_column):
+    """When something really happened: planned time + delay, in seconds."""
+    return F.unix_timestamp(planned_column) + delay_column * 60
+
+
+def recent_events(rows, events, place_columns, count_name, average_name):
+    """Count and average events of OTHER trains at the same place in the last hour.
+
+    rows:   ROW_KEY + place_columns + "now"           (seconds)
+    events: TRIP_COLUMNS + place_columns + "known_at" (seconds) + "value"
+    An event is used only if it happened before "now": the model may not see the future.
+    """
+    window = RECENT_MINUTES * 60
+    # Compare only events from the same hour slot or the slot before,
+    # so Spark does not compare every train with every other train.
+    slot = F.floor(F.col("now") / window)
+    rows = rows.withColumn("slot", F.explode(F.array(slot, slot - 1)))
+    events = (events
+              .withColumn("slot", F.floor(F.col("known_at") / window))
+              .withColumnRenamed("service_date", "event_service_date")
+              .withColumnRenamed("trip_id", "event_trip_id"))
+
+    same_train = ((F.col("event_service_date") == F.col("service_date")) &
+                  (F.col("event_trip_id") == F.col("trip_id")))
+    recent = (rows.join(events, place_columns + ["slot"])
+              .filter((F.col("known_at") >= F.col("now") - window) &
+                      (F.col("known_at") < F.col("now")) &
+                      ~same_train))
+    return recent.groupBy(*ROW_KEY).agg(
+        F.count("value").alias(count_name),
+        F.avg("value").alias(average_name),
+    )
+
+
+def add_recent_traffic_features(df):
+    """Describe what happened to other trains here in the last hour.
+
+    There is no data about the causes of delays, but a problem on the line
+    (a breakdown, works, a slow train ahead) shows up in the delays of other trains.
+    """
+    # "Now" is when our train really leaves stop N. If its departure delay
+    # is unknown, use the arrival delay, or the timetable if both are empty.
+    our_delay = F.coalesce(F.col("departure_delay_min"), F.col("arrival_delay_min"), F.lit(0.0))
+    rows = df.select(*ROW_KEY, "station_id", "next_station_id",
+                     real_time_seconds("scheduled_departure", our_delay).alias("now"))
+
+    # Hop N -> N+1: other trains that already arrived at N+1,
+    # and how many minutes they lost on this hop.
+    hop_events = df.select(
+        *TRIP_COLUMNS, "station_id", "next_station_id",
+        real_time_seconds("next_scheduled_arrival", F.col(TARGET)).alias("known_at"),
+        (F.col(TARGET) - F.col("departure_delay_min")).alias("value"),
+    )
+    # Stop N: other trains that already left N, and how many minutes they lost while standing there.
+    stop_events = df.select(
+        *TRIP_COLUMNS, "station_id",
+        real_time_seconds("scheduled_departure", F.col("departure_delay_min")).alias("known_at"),
+        (F.col("departure_delay_min") - F.col("arrival_delay_min")).alias("value"),
+    )
+
+    edge = recent_events(rows, hop_events.dropna(subset=["known_at", "value"]),
+                         ["station_id", "next_station_id"],
+                         "edge_recent_trains", "edge_recent_delay_change")
+    station = recent_events(rows.drop("next_station_id"),
+                            stop_events.dropna(subset=["known_at", "value"]),
+                            ["station_id"],
+                            "station_recent_trains", "station_recent_dwell_change")
+
+    # No other trains means a count of 0. The average stays empty: there is nothing to average.
+    return (df.join(edge, ROW_KEY, "left")
+            .join(station, ROW_KEY, "left")
+            .fillna(0, subset=["edge_recent_trains", "station_recent_trains"]))
+
+
+def planned_hour(df):
+    """The hour when a train is planned at a stop (departure, or arrival at the last stop)."""
+    return F.date_trunc("hour", F.coalesce(df["scheduled_departure"], df["scheduled_arrival"]))
+
+
+def add_network_load_features(df, stops):
+    """Count how many different trains the timetable plans at stop N in the same hour and day.
+
+    A busy station has more trains waiting for each other and for free platforms.
+    Trains per day also show how big the station is: big stations have more passengers.
+    The timetable is known in advance, so this does not reveal the target.
+    Our own train is counted too, so the values are at least 1.
+    """
+    stations = stops.select(*TRIP_COLUMNS,
+                            to_station_id("stop_id").alias("station_id"),
+                            planned_hour(stops).alias("hour"))
+    per_hour = (stations
+                .dropna(subset=["station_id", "hour"])
+                .groupBy("station_id", "hour")
+                .agg(F.countDistinct(*TRIP_COLUMNS).alias("station_trains_per_hour")))
+    # A day is the service day of the train, as in the rest of the data.
+    per_day = (stations
+               .dropna(subset=["station_id"])
+               .groupBy("station_id", "service_date")
+               .agg(F.countDistinct("trip_id").alias("station_trains_per_day")))
+    return (df.withColumn("hour", planned_hour(df))
+            .join(per_hour, ["station_id", "hour"], "left")
+            .join(per_day, ["station_id", "service_date"], "left")
+            .drop("hour"))
+
+
+def add_edge_history_features(df, stats_end):
+    """Describe how the hop N -> N+1 usually behaves: how many minutes trains lose on it.
+
+    Two rules keep the target hidden:
+    - only days up to stats_end are used, so validation and test days are never seen;
+    - a row never uses its own day, otherwise its own target would be in the average.
+    """
+    edge = ["station_id", "next_station_id"]
+    change = F.col(TARGET) - F.col("departure_delay_min")
+
+    # Sums per hop and day. Sums (not averages) are used, so that one day can be subtracted later.
+    per_day = (df.filter((F.col("service_date") <= F.to_date(F.lit(stats_end))) & change.isNotNull())
+               .groupBy(*edge, "service_date")
+               .agg(F.count("*").alias("day_hops"),
+                    F.sum(change).alias("day_change"),
+                    F.sum((change >= GAIN_MINUTES).cast("long")).alias("day_gains")))
+    totals = per_day.groupBy(*edge).agg(
+        F.sum("day_hops").alias("all_hops"),
+        F.sum("day_change").alias("all_change"),
+        F.sum("day_gains").alias("all_gains"),
+    )
+
+    def without_own_day(name):
+        # Total over all days minus the row's own day (0 if that day is not used at all).
+        return F.coalesce(F.col(f"all_{name}"), F.lit(0)) - F.coalesce(F.col(f"day_{name}"), F.lit(0))
+
+    hops = without_own_day("hops")
+    enough = hops >= MIN_HISTORY_HOPS
+    return (df.join(totals, edge, "left")
+            .join(per_day, edge + ["service_date"], "left")
+            # Number of hops on other days the averages are based on
+            .withColumn("edge_history_hops", hops)
+            # Average minutes lost on this hop
+            .withColumn("edge_typical_delay_change", F.when(enough, without_own_day("change") / hops))
+            # Share of trains that lost at least GAIN_MINUTES on this hop
+            .withColumn("edge_share_gain_3min", F.when(enough, without_own_day("gains") / hops))
+            .drop("all_hops", "all_change", "all_gains", "day_hops", "day_change", "day_gains"))
+
+
 def main():
     # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Create model features using Spark")
@@ -114,6 +371,8 @@ def main():
     parser.add_argument("--duplicates", default="/opt/project/data/clean/review_duplicates.parquet")
     parser.add_argument("--output", default="/opt/project/data/clean/features.parquet")
     parser.add_argument("--master", default=os.environ.get("SPARK_MASTER", "local[*]"))
+    parser.add_argument("--stats-end", default=STATS_END, type=date.fromisoformat,
+                        help="Last day (YYYY-MM-DD) used to learn the typical behaviour of hops")
     args = parser.parse_args()
     # "overwrite" deletes the output first, so it must never be an input.
     inputs = [args.pairs, args.stops, args.duplicates]
@@ -124,6 +383,10 @@ def main():
     spark = (SparkSession.builder.appName("RailPredict-Build-Features")
              .master(args.master)
              .config("spark.sql.session.timeZone", "UTC")
+             # Do not copy a whole table to every worker for a join (a "broadcast").
+             # The pairs are joined with themselves, and such a copy does not fit
+             # into the default driver memory of 1 GB.
+             .config("spark.sql.autoBroadcastJoinThreshold", "-1")
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
@@ -132,8 +395,11 @@ def main():
         # For the first and last station we need the full route of a trip:
         # model_stops has some stops removed, and clean_stops does not include
         # conflicting duplicates. Their records differ in times and delays,
-        # but they still show which station the trip visits.
-        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id"]
+        # but they still show which station the trip visits and when.
+        # The planned times are needed to count trains per station and hour,
+        # the names to find trains going to a big city.
+        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id", "stop_name",
+                                  "scheduled_arrival", "scheduled_departure"]
         stops = (spark.read.parquet(args.stops).select(*columns)
                  .unionByName(spark.read.parquet(args.duplicates).select(*columns)))
         pair_rows = pairs.count()
@@ -144,6 +410,13 @@ def main():
         df = add_station_features(df)
         df = add_route_features(df)
         df = add_schedule_features(df)
+        df = add_commuter_peak_feature(df)
+        df = add_big_city_features(df)
+        df = add_trip_history_features(df)
+        df = add_recent_traffic_features(df)
+        df = add_network_load_features(df, stops)
+        df = add_edge_history_features(df, args.stats_end.isoformat())
+        df = add_trip_position_features(df, stops)
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
