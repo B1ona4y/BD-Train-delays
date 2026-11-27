@@ -308,6 +308,10 @@ def main():
     spark = (SparkSession.builder.appName("RailPredict-Build-Features")
              .master(args.master)
              .config("spark.sql.session.timeZone", "UTC")
+             # Do not copy a whole table to every worker for a join (a "broadcast").
+             # The pairs are joined with themselves, and such a copy does not fit
+             # into the default driver memory of 1 GB.
+             .config("spark.sql.autoBroadcastJoinThreshold", "-1")
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
