@@ -45,6 +45,8 @@ NUMERIC_FEATURES = [
     "edge_history_hops", "edge_typical_delay_change", "edge_share_gain_3min",
     # Position in the trip: how many stops are left until the last one.
     "stops_to_end",
+    # Passenger demand (there is no data about the number of passengers).
+    "is_commuter_peak",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -64,6 +66,9 @@ STATS_END = "2026-11-20"
 MIN_HISTORY_HOPS = 10
 # A hop where the train loses at least this many minutes counts as a "gain" of delay.
 GAIN_MINUTES = 3
+
+# Hours when people travel to and from work: [start, end), on working days.
+COMMUTER_PEAK_HOURS = [(6, 9), (15, 18)]
 
 # These columns are saved too, but they are NOT features.
 # service_date: train/test split. trip_id: checks. target_outlier: evaluating results.
@@ -147,6 +152,24 @@ def add_schedule_features(df):
             # Planned waiting time at stop N
             .withColumn("scheduled_dwell_min",
                         minutes_between("scheduled_arrival", "scheduled_departure")))
+
+
+def add_commuter_peak_feature(df):
+    """Mark departures in the morning and evening rush hours of working days.
+
+    In rush hours trains are full, and boarding takes longer.
+    The day is taken from the departure time itself, so a night train
+    after midnight gets the day it really leaves on.
+    """
+    hour = F.col("departure_hour")
+    # Spark numbering: 2 = Monday, ..., 6 = Friday
+    working_day = F.dayofweek("scheduled_departure").between(2, 6)
+    in_peak = F.lit(False)
+    for start, end in COMMUTER_PEAK_HOURS:
+        in_peak = in_peak | ((hour >= start) & (hour < end))
+    # Without a departure time it is unknown, so it stays empty.
+    return df.withColumn("is_commuter_peak",
+                         F.when(hour.isNotNull(), (working_day & in_peak).cast("int")))
 
 
 def add_trip_history_features(df):
@@ -349,6 +372,7 @@ def main():
         df = add_station_features(df)
         df = add_route_features(df)
         df = add_schedule_features(df)
+        df = add_commuter_peak_feature(df)
         df = add_trip_history_features(df)
         df = add_recent_traffic_features(df)
         df = add_network_load_features(df, stops)
