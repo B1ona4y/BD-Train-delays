@@ -1,4 +1,8 @@
-"""Outputs (all within data/clean/):
+"""Clean the raw railway data (one row = one stop of one trip).
+
+Input:  data/dirty/*.parquet
+
+Outputs (all within data/clean/):
   clean_stops.parquet/           Unique, validated stop records (all statuses)
   model_stops.parquet/           Stops eligible for ML feature engineering
   review_duplicates.parquet/     Conflicting versions of the same stop
@@ -26,18 +30,22 @@ REQUIRED_COLUMNS = [
     "service_date", "trip_id", "stop_sequence", "trip_status", "stop_status",
     "arrival_delay_min", "departure_delay_min", "scheduled_arrival",
     "scheduled_departure", "predicted_arrival", "predicted_departure",
-    "observed_at",
+    "observed_at", "delay_source",
 ]
+# These three columns together identify one stop of one trip.
 KEY_COLUMNS = ["service_date", "trip_id", "stop_sequence"]
+# Columns converted from text to date and time.
 TIMESTAMP_COLUMNS = [
     "scheduled_arrival", "scheduled_departure", "predicted_arrival",
     "predicted_departure", "observed_at",
 ]
 DELAY_COLUMNS = ["arrival_delay_min", "departure_delay_min"]
+# These columns are removed only if they contain no values at all.
 DROP_ALWAYS_EMPTY = ["feed_id", "trip_start_time"]
 
 
 def aggregate_counts(df):
+    """Count rows, missing delays, cancelled and skipped records."""
     return df.agg(
         F.count("*").alias("rows"),
         F.sum(F.col("arrival_delay_min").isNull().cast("long")).alias("missing_arrival_delay"),
@@ -48,6 +56,7 @@ def aggregate_counts(df):
 
 
 def main():
+    # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Clean railway stop data using Spark")
     parser.add_argument("--input", default="/opt/project/data/dirty")
     parser.add_argument("--output", default="/opt/project/data/clean")
@@ -60,6 +69,8 @@ def main():
     if args.outlier_threshold <= 0:
         parser.error("--outlier-threshold must be greater than zero")
 
+    # Set up log messages and connect to Spark.
+    # UTC keeps Spark from shifting times between time zones.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     spark = (SparkSession.builder.appName("RailPredict-Clean-Stops")
              .master(args.master)
@@ -68,6 +79,7 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     try:
+        # 1. Read the raw data and stop early if something important is missing.
         raw = spark.read.parquet(args.input)
         missing = sorted(set(REQUIRED_COLUMNS) - set(raw.columns))
         if missing:
@@ -78,6 +90,7 @@ def main():
         if raw_rows == 0:
             raise ValueError("Input dataset is empty")
 
+        # 2. Normalize text and data types.
         # Normalize whitespace and blank strings before parsing timestamps.
         df = raw
         for field in df.schema.fields:
@@ -94,10 +107,12 @@ def main():
         for name in TIMESTAMP_COLUMNS:
             df = df.withColumn(name, F.to_timestamp(name, "yyyy-MM-dd HH:mm:ss"))
 
+        # 3. Remove columns that are completely empty.
         removed_empty_columns = [name for name in DROP_ALWAYS_EMPTY
                                  if name in df.columns and df.filter(F.col(name).isNotNull()).limit(1).count() == 0]
         df = df.drop(*removed_empty_columns)
 
+        # 4. Set aside rows that cannot be identified.
         invalid_key = (
                 F.col("service_date").isNull() |
                 F.col("trip_id").isNull() |
@@ -108,6 +123,7 @@ def main():
         with_keys = df.filter(~invalid_key)
         invalid_rows = invalid.count()
 
+        # 5. Remove duplicates.
         # Remove exact duplicates only
         equality_columns = [name for name in with_keys.columns if name != "source_file"]
         exact_deduped = with_keys.dropDuplicates(equality_columns)
@@ -121,26 +137,32 @@ def main():
         conflicting = exact_deduped.join(multiplicities, KEY_COLUMNS, "inner")
         clean = exact_deduped.join(multiplicities, KEY_COLUMNS, "left_anti")
 
+        # Check that every input row is accounted for.
         clean_rows = clean.count()
         conflicting_rows = conflicting.count()
         assert raw_rows == (invalid_rows + exact_duplicates_removed + conflicting_rows + clean_rows), (
             "Row accounting mismatch: check ETL transformations"
         )
 
+        # Statistics for the quality report.
         stats = aggregate_counts(clean)
         null_counts = clean.agg(*[
             F.sum(F.col(c).isNull().cast("long")).alias(c)
             for c in clean.columns
         ]).first().asDict()
 
+        # 6. Select the stops that can be used for the model.
+        # Keep normal trips only.
         scheduled = clean.filter(F.col("trip_status") == "scheduled")
         excluded_trip_status = clean_rows - scheduled.count()
 
+        # Remove stops the train did not serve. An empty stop_status is kept.
         non_skipped = scheduled.filter(
             F.col("stop_status").isNull() | (F.col("stop_status") != "skipped")
         )
         excluded_skipped = scheduled.count() - non_skipped.count()
 
+        # By default keep only delays whose source is "feed".
         if args.include_propagated:
             model_base = non_skipped
             excluded_delay_source = 0
@@ -148,6 +170,7 @@ def main():
             model_base = non_skipped.filter(F.col("delay_source") == "feed")
             excluded_delay_source = non_skipped.count() - model_base.count()
 
+        # 7. Mark very large delays. They are NOT removed.
         threshold = args.outlier_threshold
         model_stops = (model_base
                        .withColumn("arrival_delay_outlier",
@@ -167,12 +190,14 @@ def main():
             "Model filter row accounting mismatch"
         )
 
+        # 8. Save the datasets. "overwrite" replaces previous results.
         output = args.output.rstrip("/")
         clean.write.mode("overwrite").parquet(f"{output}/clean_stops.parquet")
         model_stops.write.mode("overwrite").parquet(f"{output}/model_stops.parquet")
         conflicting.write.mode("overwrite").parquet(f"{output}/review_duplicates.parquet")
         invalid.write.mode("overwrite").parquet(f"{output}/invalid_keys.parquet")
 
+        # 9. Save two reports: what was cleaned and what was filtered.
         report = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "input_path": args.input,
@@ -227,6 +252,7 @@ def main():
         model_report_path.write_text(json.dumps(model_report, indent=2, ensure_ascii=False, default=str) + "\n",
                                      encoding="utf-8")
 
+        # 10. Print a short summary.
         LOG.info("Clean records: %s", clean_rows)
         LOG.info("Model stop records: %s", model_rows)
         LOG.info("Model exclusions - train status: %s; skipped stop: %s; non-feed delay source: %s",
@@ -239,6 +265,7 @@ def main():
         LOG.info("Conflicting keys: %s; records quarantined: %s", conflicting_key_count, conflicting_rows)
         LOG.info("Report: %s", report_path)
         LOG.info("Finished ETL successfully")
+    # Always close Spark, even if an error happened above.
     finally:
         spark.stop()
 

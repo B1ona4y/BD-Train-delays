@@ -3,7 +3,7 @@
 Also serves as the check "Spark can read the data".
 
 Run inside the cluster (recommended):
-    docker compose exec jupyter spark-submit --master spark://spark-master:7077 \
+    docker compose exec jupyter /opt/spark/bin/spark-submit --master spark://spark-master:7077 \
         /opt/project/src/spark_inspect.py
 
 Or locally (needs Java 17/21):

@@ -1,0 +1,17 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.debugpy",
+    "ms-toolsai.jupyter",
+    "ms-toolsai.datawrangler",
+    "charliermarsh.ruff",
+    "mechatroner.rainbow-csv",
+    "dvirtz.parquet-viewer",
+    "jeppeandersen.vscode-kafka",
+    "redhat.vscode-yaml",
+    "ms-azuretools.vscode-docker",
+    "github.vscode-pull-request-github",
+    "mikestead.dotenv"
+  ]
+}
