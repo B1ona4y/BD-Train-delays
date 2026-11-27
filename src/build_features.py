@@ -34,6 +34,8 @@ NUMERIC_FEATURES = [
     # Other trains in the last hour: on the same hop N -> N+1 and at the same stop N.
     "edge_recent_trains", "edge_recent_delay_change",
     "station_recent_trains", "station_recent_dwell_change",
+    # Network load: how many trains the timetable plans at stop N in this hour.
+    "station_trains_per_hour",
 ]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
@@ -209,6 +211,30 @@ def add_recent_traffic_features(df):
             .fillna(0, subset=["edge_recent_trains", "station_recent_trains"]))
 
 
+def planned_hour(df):
+    """The hour when a train is planned at a stop (departure, or arrival at the last stop)."""
+    return F.date_trunc("hour", F.coalesce(df["scheduled_departure"], df["scheduled_arrival"]))
+
+
+def add_network_load_features(df, stops):
+    """Count how many different trains the timetable plans at stop N in the same hour.
+
+    A busy station has more trains waiting for each other and for free platforms.
+    The timetable is known in advance, so this does not reveal the target.
+    Our own train is counted too, so the value is at least 1.
+    """
+    load = (stops
+            .select(*TRIP_COLUMNS,
+                    to_station_id("stop_id").alias("station_id"),
+                    planned_hour(stops).alias("hour"))
+            .dropna(subset=["station_id", "hour"])
+            .groupBy("station_id", "hour")
+            .agg(F.countDistinct(*TRIP_COLUMNS).alias("station_trains_per_hour")))
+    return (df.withColumn("hour", planned_hour(df))
+            .join(load, ["station_id", "hour"], "left")
+            .drop("hour"))
+
+
 def main():
     # Settings that can be changed from the command line.
     parser = argparse.ArgumentParser(description="Create model features using Spark")
@@ -235,8 +261,9 @@ def main():
         # For the first and last station we need the full route of a trip:
         # model_stops has some stops removed, and clean_stops does not include
         # conflicting duplicates. Their records differ in times and delays,
-        # but they still show which station the trip visits.
-        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id"]
+        # but they still show which station the trip visits and when.
+        # The planned times are needed to count trains per station and hour.
+        columns = TRIP_COLUMNS + ["stop_sequence", "stop_id", "scheduled_arrival", "scheduled_departure"]
         stops = (spark.read.parquet(args.stops).select(*columns)
                  .unionByName(spark.read.parquet(args.duplicates).select(*columns)))
         pair_rows = pairs.count()
@@ -249,6 +276,7 @@ def main():
         df = add_schedule_features(df)
         df = add_trip_history_features(df)
         df = add_recent_traffic_features(df)
+        df = add_network_load_features(df, stops)
 
         # Keep only the features, the target and the extra columns.
         result = df.select(*EXTRA_COLUMNS, *FEATURES, TARGET)
